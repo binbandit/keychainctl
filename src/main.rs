@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, File};
+use std::ffi::OsString;
+use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use dialoguer::Confirm;
+
+const SECURITY_BIN: &str = "/usr/bin/security";
+const WHOAMI_BIN: &str = "/usr/bin/whoami";
 
 #[derive(Parser)]
 #[command(
@@ -67,84 +70,149 @@ enum CommandKind {
 }
 
 fn main() -> Result<()> {
+    if try_run_fast_get()? {
+        return Ok(());
+    }
+
     let cli = Cli::parse();
+    run(cli)
+}
+
+fn try_run_fast_get() -> Result<bool> {
+    let Some((service, account)) = parse_fast_get_args()? else {
+        return Ok(false);
+    };
+
+    let account = resolve_account(account)?;
+    let value = keychain_get(&account, &service)?;
+    println!("{}", value);
+    Ok(true)
+}
+
+fn parse_fast_get_args() -> Result<Option<(String, Option<String>)>> {
+    let arguments: Vec<OsString> = env::args_os().collect();
+    if arguments.len() < 3 || arguments[1] != "get" {
+        return Ok(None);
+    }
+
+    if arguments[2] == "-h" || arguments[2] == "--help" {
+        return Ok(None);
+    }
+
+    let service = argument_to_string(&arguments[2], "service")?;
+
+    if arguments.len() == 3 {
+        return Ok(Some((service, None)));
+    }
+
+    if arguments.len() == 5 && (arguments[3] == "-a" || arguments[3] == "--account") {
+        let account = argument_to_string(&arguments[4], "account")?;
+        return Ok(Some((service, Some(account))));
+    }
+
+    Ok(None)
+}
+
+fn argument_to_string(value: &OsString, name: &str) -> Result<String> {
+    value
+        .to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("{} must be valid UTF-8", name))
+}
+
+fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        CommandKind::Get { service, account } => {
-            let account = resolve_account(account)?;
-            let value = keychain_get(&account, &service)?;
-            println!("{}", value);
-        }
+        CommandKind::Get { service, account } => run_get(service, account),
         CommandKind::Set {
             service,
             account,
             value,
             stdin,
             prompt,
-        } => {
-            let account = resolve_account(account)?;
-            let secret = resolve_secret_value(value, stdin, prompt)?;
-            keychain_set(&account, &service, &secret)?;
-            registry_add(&account, &service)?;
-            println!(
-                "Saved secret for service `{}` (account {}).",
-                service, account
-            );
-        }
+        } => run_set(service, account, value, stdin, prompt),
         CommandKind::Delete {
             service,
             account,
             yes,
-        } => {
-            let account = resolve_account(account)?;
-            if !yes {
-                let confirmed = Confirm::new()
-                    .with_prompt(format!(
-                        "Remove keychain secret for service `{}` (account {})?",
-                        service, account
-                    ))
-                    .default(false)
-                    .interact()?;
-                if !confirmed {
-                    println!("Aborted.");
-                    return Ok(());
-                }
-            }
-            keychain_delete(&account, &service)?;
-            registry_remove(&account, &service)?;
-            println!(
-                "Removed secret for service `{}` (account {}).",
-                service, account
-            );
+        } => run_delete(service, account, yes),
+        CommandKind::List { account } => run_list(account),
+    }
+}
+
+fn run_get(service: String, account: Option<String>) -> Result<()> {
+    let account = resolve_account(account)?;
+    let value = keychain_get(&account, &service)?;
+    println!("{}", value);
+    Ok(())
+}
+
+fn run_set(
+    service: String,
+    account: Option<String>,
+    value: Option<String>,
+    stdin: bool,
+    prompt: bool,
+) -> Result<()> {
+    let account = resolve_account(account)?;
+    let secret = resolve_secret_value(value, stdin, prompt)?;
+    keychain_set(&account, &service, &secret)?;
+    registry_add(&account, &service)?;
+    println!(
+        "Saved secret for service `{}` (account {}).",
+        service, account
+    );
+    Ok(())
+}
+
+fn run_delete(service: String, account: Option<String>, yes: bool) -> Result<()> {
+    let account = resolve_account(account)?;
+    if !yes {
+        let confirmed = confirm_delete(&service, &account)?;
+        if !confirmed {
+            println!("Aborted.");
+            return Ok(());
         }
-        CommandKind::List { account } => {
-            let account = resolve_account(account)?;
-            let services = registry_list(&account)?;
-            if services.is_empty() {
-                println!("No tracked secrets for account {}.", account);
-            } else {
-                for service in services {
-                    println!("{}", service);
-                }
-            }
-        }
+    }
+
+    keychain_delete(&account, &service)?;
+    registry_remove(&account, &service)?;
+    println!(
+        "Removed secret for service `{}` (account {}).",
+        service, account
+    );
+    Ok(())
+}
+
+fn run_list(account: Option<String>) -> Result<()> {
+    let account = resolve_account(account)?;
+    let services = registry_list(&account)?;
+    if services.is_empty() {
+        println!("No tracked secrets for account {}.", account);
+        return Ok(());
+    }
+
+    for service in services {
+        println!("{}", service);
     }
     Ok(())
 }
 
 fn resolve_account(account: Option<String>) -> Result<String> {
-    if let Some(account) = account {
+    if let Some(account) = account.filter(|value| !value.trim().is_empty()) {
         return Ok(account);
     }
-    if let Ok(user) = env::var("USER") {
+    if let Ok(user) = env::var("USER")
+        && !user.trim().is_empty()
+    {
         return Ok(user);
     }
-    let output = Command::new("whoami")
+    let output = Command::new(WHOAMI_BIN)
         .output()
         .context("failed to determine current user")?;
     if !output.status.success() {
         return Err(anyhow!("failed to determine account"));
     }
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    Ok(strip_trailing_newlines(String::from_utf8(output.stdout)?))
 }
 
 fn resolve_secret_value(
@@ -162,7 +230,7 @@ fn resolve_secret_value(
         io::stdin()
             .read_to_string(&mut buffer)
             .context("failed to read secret from stdin")?;
-        return Ok(buffer.trim_end_matches(['\n', '\r']).to_string());
+        return Ok(strip_trailing_newlines(buffer));
     }
 
     if prompt_flag || stdin_is_terminal {
@@ -177,7 +245,7 @@ fn resolve_secret_value(
 }
 
 fn keychain_get(account: &str, service: &str) -> Result<String> {
-    let output = Command::new("security")
+    let output = Command::new(SECURITY_BIN)
         .args(["find-generic-password", "-w", "-a", account, "-s", service])
         .output()
         .with_context(|| format!("failed to read secret `{}`", service))?;
@@ -190,11 +258,18 @@ fn keychain_get(account: &str, service: &str) -> Result<String> {
         return Err(anyhow!("security command failed: {}", stderr.trim()));
     }
 
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    Ok(strip_trailing_newlines(String::from_utf8(output.stdout)?))
+}
+
+fn strip_trailing_newlines(mut value: String) -> String {
+    while matches!(value.as_bytes().last(), Some(b'\n' | b'\r')) {
+        value.pop();
+    }
+    value
 }
 
 fn keychain_set(account: &str, service: &str, value: &str) -> Result<()> {
-    let status = Command::new("security")
+    let status = Command::new(SECURITY_BIN)
         .args([
             "add-generic-password",
             "-a",
@@ -216,7 +291,7 @@ fn keychain_set(account: &str, service: &str, value: &str) -> Result<()> {
 }
 
 fn keychain_delete(account: &str, service: &str) -> Result<()> {
-    let output = Command::new("security")
+    let output = Command::new(SECURITY_BIN)
         .args(["delete-generic-password", "-a", account, "-s", service])
         .output()
         .with_context(|| format!("failed to delete secret `{}`", service))?;
@@ -256,16 +331,33 @@ fn registry_remove(account: &str, service: &str) -> Result<()> {
 
 fn registry_list(account: &str) -> Result<Vec<String>> {
     let registry = load_registry()?;
-    let mut services: Vec<String> = registry
+    let services: Vec<String> = registry
         .get(account)
         .map(|set| set.iter().cloned().collect())
         .unwrap_or_default();
-    services.sort();
     Ok(services)
 }
 
+fn confirm_delete(service: &str, account: &str) -> Result<bool> {
+    print!(
+        "Remove keychain secret for service `{}` (account {})? [y/N]: ",
+        service, account
+    );
+    io::stdout().flush().context("failed to write prompt")?;
+
+    let mut response = String::new();
+    io::stdin()
+        .read_line(&mut response)
+        .context("failed to read confirmation")?;
+
+    let answer = response.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+}
+
 fn config_dir() -> Result<PathBuf> {
-    if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
+    if let Ok(dir) = env::var("XDG_CONFIG_HOME")
+        && !dir.trim().is_empty()
+    {
         return Ok(Path::new(&dir).join("keychainctl"));
     }
     let home = env::var("HOME").context("HOME not set")?;
@@ -300,11 +392,17 @@ fn save_registry(map: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("failed to create registry directory")?;
     }
-    let mut file = File::create(&path).context("failed to open registry for writing")?;
+
+    let mut data = String::new();
     for (account, services) in map {
         for service in services {
-            writeln!(file, "{}\t{}", account, service)?;
+            data.push_str(account);
+            data.push('\t');
+            data.push_str(service);
+            data.push('\n');
         }
     }
+
+    fs::write(&path, data).context("failed to write registry file")?;
     Ok(())
 }
