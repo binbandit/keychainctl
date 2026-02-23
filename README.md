@@ -1,12 +1,8 @@
 # keychainctl
 
-`keychainctl` is a tiny command-line tool for storing and reading development secrets from the macOS keychain.
+`keychainctl` is a small command-line tool for storing and reading development secrets from the macOS keychain.
 
-I built this for shell startup and local scripts where I wanted one simple thing:
-
-- read a secret quickly
-- keep secrets out of dotfiles
-- avoid extra services or background daemons
+It is meant for local scripts and shell startup where secret lookup needs to be simple and fast.
 
 ## What it does
 
@@ -15,7 +11,7 @@ I built this for shell startup and local scripts where I wanted one simple thing
 - `delete`: remove a secret
 - `list`: show tracked service names per account
 
-The tool uses the system `security` utility under the hood, so secrets stay in your login keychain.
+The tool calls the system `security` utility, so secrets stay in your login keychain.
 
 ## Install
 
@@ -29,7 +25,7 @@ Or build locally:
 cargo build --release
 ```
 
-## Quick start
+## Quick Start
 
 Set a secret (interactive hidden prompt):
 
@@ -65,7 +61,7 @@ keychainctl delete github_token
 
 - Account defaults to `$USER`.
 - Service names are tracked in `~/.config/keychainctl/registry.txt` (or `$XDG_CONFIG_HOME/keychainctl/registry.txt`).
-- `get` is optimized for common invocation patterns because it is often used in shell startup paths.
+- `get` has a fast path for common invocation patterns used in shell startup.
 
 ## Exit behavior
 
